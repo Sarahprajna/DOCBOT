@@ -1,85 +1,78 @@
 import streamlit as st
 from PyPDF2 import PdfReader
-from langchain.embeddings import SentenceTransformerEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from transformers import pipeline
-import torch
 from langchain.chains import RetrievalQA
 from langchain.llms import HuggingFacePipeline
-import chromadb
-from langchain.document_loaders import DirectoryLoader
-from streamlit_lottie import st_lottie
-import requests
+from chromadb.config import Settings
+from langchain.vectorstores import Chroma
+from langchain.docstore.document import Document
+from langchain.embeddings import HuggingFaceInstructEmbeddings
+import torch
+from langchain.llms import CTransformers
 
-@st.cache_resource
+
+device = torch.device('cpu')
+
+
+def chroma_settings():
+    settings = Settings(
+        chroma_db_impl='duckdb+parquet',
+        persist_directory='db',
+        anonymized_telemetry=False
+    )
+    return settings
+
+
 def load_model():
-    tokenizer = AutoTokenizer.from_pretrained("TheBloke/Llama-2-7B-Chat-GGML")
-    model = AutoModelForSeq2SeqLM.from_pretrained("TheBloke/Llama-2-7B-Chat-GGML")
-    base_model = AutoModelForSeq2SeqLM.from_pretrained(
-        model=model,
-        tokenizer=tokenizer,
-        device_map="auto",
-        torch_dtype=torch.float32,
-        from_tf=True
+    # Load the locally downloaded model here
+    llm = CTransformers(
+        model="llama-2-7b-chat.ggmlv3.q8_0.bin",
+        model_type="llama",
+        max_new_tokens=512,
+        temperature=0.5
     )
-    return base_model
-def get_embeddings(pdfs):
-    loaders = []
-    loaders1 = ""
-    pdf_loader1 = DirectoryLoader(loaders, glob="**/*.documents")
-    for pdf in pdfs:
-        loaders.append(pdf)
+    return llm
 
 
-    # lets create document
-    documents = []
-    tests = []
-    for loader in loaders:
-        documents.append(loader.load())
-    for doc in documents:
-        print("splitting into chunks")
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        texts1 = text_splitter.split_documents(doc)
-        tests += texts1
+def textsplitter():
+    # Pass uploaded_text as an argument to the function
+    global uploaded_text
+    # Convert each item in uploaded_text to a Document object
+    texts = []
+    for txt in uploaded_text:
+        doc = Document(page_content=txt)
+        texts.append(doc)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    tests = text_splitter.split_documents(texts)
+    return tests
+
+
+def embeddings():
     # create embeddings here
-    print("Loading sentence transformers model")
-    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-    sent_embeddings = []
+    sent_embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-xl", model_kwargs={"device": "cuda"})
+    return sent_embeddings
 
-    for text in tests:
-        # Generate embeddings
-        sent_embeddings1 = embeddings.embed_documents(text)
 
-        # Flatten the nested list
-        sent_embeddings_flat = []
-        for embedding in sent_embeddings1:
-            for inner_embedding in embedding:
-                sent_embeddings_flat.append(inner_embedding)
+def database():
+    settings = chroma_settings()
+    tests = textsplitter()
+    sent_embeddings = embeddings()
+    cdb = Chroma.from_documents(tests, sent_embeddings, persist_directory="db", client_settings=settings)
+    cdb.persist()
+    cdb = None
+    return cdb
 
-        sent_embeddings.append(sent_embeddings_flat)
 
-    # Process the embeddings
-    print(sent_embeddings)
-    print(f"Creating embeddings. May take some minutes...")
-    client = chromadb.Client()
-    collection = client.create_collection("My_Collection")
-    id = []
-    for n in range(0, len(sent_embeddings)):
-        x = f"id{n}"
-        y = str(x)
-        id.append(y)
-    collection.add(
-        embeddings=sent_embeddings,
-        documents=tests,
-        ids=id
-    )
+def vector_database():
+    database()
+    sent_embeddings = embeddings()
+    vector_db = Chroma(persist_directory='db', embedding_function=sent_embeddings)
+    return vector_db
 
-    return tests, collection,
 
 @st.cache_resource
 def llm_pipeline():
-    pipe = pipeline(
+    pipe = HuggingFacePipeline(
         'text2text-generation',
         model=load_model(),
         max_length=256,
@@ -90,31 +83,27 @@ def llm_pipeline():
     local_llm = HuggingFacePipeline(pipeline=pipe)
     return local_llm
 
+
 # creates a Question Answering (QA) model based on the LLM pipeline and the Chroma database.
+@st.cache_resource
 def qa_llm():
     llm = llm_pipeline()
-    # Connect to the ChromaDB database
-    db = chromadb.connect()
-
-    # Create a retriever object
+    embedding = embeddings()
+    settings = chroma_settings()
+    db = Chroma(persist_directory="db", embedding_function=embedding, client_settings=settings)
     retriever = db.as_retriever()
-
-    # Initialize the QA model
     qa = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
         retriever=retriever,
         return_source_documents=True
     )
-
     return qa
 
-#this function takes an instruction, loads a QA model,
-# generates an answer using the model,
-# extracts the answer from the model's response,
-# and returns both the answer and the generated text.
 
-def process_answer(instruction):
+def process_answer():
+    global instruction
+    global answer
     qa = qa_llm()
     generated_text = qa(instruction)
     answer = generated_text['result']
@@ -141,22 +130,31 @@ with st.expander("About Docbot"):
         DOCBOT is still under development this is just a demo of communications with multiple Documents.
         """
     )
+
 st.header("CHAT WITH DOCBOT 👾")
 user_input = st.text_area("ASK YOUR QUERY....")
-if st.button("SEND"):
-    st.info("Your Question" + user_input)
-    st.info("Your Answer:")
-    instruction = user_input
-    if user_input:
-        answer, metadata = process_answer(instruction)
-        st.write("DocBot:", answer)
-        st.write("DocBot:", metadata)
+st.write("Query:" + user_input)
+st.write("DocBot:")
 
-# Display the title and sidebar
+
+def handle_send_button_click():
+    if not user_input:
+        st.error("Please enter a query to proceed.")
+    return
+
+
+instruction = user_input
+if user_input:
+    answer, metadata = process_answer()
+    st.write("DocBot:", answer)
+    st.write("DocBot:", metadata)
+if st.button("SEND"):
+    handle_send_button_click()
 
 with st.sidebar:
     st.sidebar.title("DOCBOT 👾",)
     pdfs = st.file_uploader("Upload Your Documents", accept_multiple_files=True)
+
     # Check if the PDFs are not None
     if pdfs is not None:
         for pdf in pdfs:
@@ -164,15 +162,19 @@ with st.sidebar:
             if file_extension == "pdf":
                 pdf_reader = PdfReader(pdf)
                 text = ""
+                document = []
                 for page in pdf_reader.pages:
+                    document += page.extract_text()
                     text += page.extract_text()
-                uploaded_text = text
-                st.write(uploaded_text)
+                uploaded_text1 = text
+                uploaded_text = document
+                st.write(uploaded_text1)
                 is_pdf_uploaded = True
     submit_button = st.sidebar.button("SUBMIT")
 
-    if submit_button :
-        vector_store = get_embeddings(pdfs)
+    if submit_button:
+        vector_database()
+        # Pass the uploaded_text variable as an argument
         st.sidebar.text("Files submitted and processed.")
 
 previously_asked_queries = []
