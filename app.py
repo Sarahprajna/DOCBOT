@@ -1,23 +1,46 @@
 import streamlit as st
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
-from langchain.llms import HuggingFacePipeline
-from chromadb.config import Settings
 from langchain.vectorstores import Chroma
 from langchain.docstore.document import Document
 from langchain.embeddings import HuggingFaceInstructEmbeddings
 import torch
 from langchain.llms import CTransformers
+import chromadb
+from chromadb.config import Settings
 
 
-device = torch.device('cpu')
+device = torch.device('cuda')
+
+
+custom_prompt_template = """Use the following pieces of information to answer the user's question.
+If you don't know the answer, just say that you don't know, don't try to make up an answer.
+
+Context: {context}
+Question: {question}
+
+Only return the helpful answer below and nothing else.
+Helpful answer:
+"""
+
+
+def set_custom_prompt():
+    """
+    Prompt template for QA retrieval for each vectorstore
+    """
+    prompt = PromptTemplate(template=custom_prompt_template,
+                            input_variables=['context', 'question'])
+    return prompt
 
 
 def chroma_settings():
     settings = Settings(
-        chroma_db_impl='duckdb+parquet',
+        chroma_api_impl="chromadb.api.fastapi.FastAPI",
         persist_directory='db',
+        chroma_server_host='localhost',
+        chroma_server_http_port='8000',
         anonymized_telemetry=False
     )
     return settings
@@ -26,7 +49,7 @@ def chroma_settings():
 def load_model():
     # Load the locally downloaded model here
     llm = CTransformers(
-        model="llama-2-7b-chat.ggmlv3.q8_0.bin",
+        model="TheBloke/Llama-2-7B-Chat-GGML",
         model_type="llama",
         max_new_tokens=512,
         temperature=0.5
@@ -49,15 +72,17 @@ def textsplitter():
 
 def embeddings():
     # create embeddings here
-    sent_embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-xl", model_kwargs={"device": "cuda"})
+    sent_embeddings = HuggingFaceInstructEmbeddings(model_name="all-MiniLM-L6-v2", model_kwargs={"device": "cuda"})
     return sent_embeddings
 
 
 def database():
+
     settings = chroma_settings()
     tests = textsplitter()
     sent_embeddings = embeddings()
-    cdb = Chroma.from_documents(tests, sent_embeddings, persist_directory="db", client_settings=settings)
+    client = chromadb.HttpClient(host='localhost', port='8000')
+    cdb = Chroma.from_documents(tests, sent_embeddings, persist_directory="db", client_settings=settings, client=client)
     cdb.persist()
     cdb = None
     return cdb
@@ -70,34 +95,15 @@ def vector_database():
     return vector_db
 
 
-@st.cache_resource
-def llm_pipeline():
-    pipe = HuggingFacePipeline(
-        'text2text-generation',
-        model=load_model(),
-        max_length=256,
-        do_sample="True",
-        temperature=0.5,
-        top_p=0.95
-    )
-    local_llm = HuggingFacePipeline(pipeline=pipe)
-    return local_llm
-
-
 # creates a Question Answering (QA) model based on the LLM pipeline and the Chroma database.
 @st.cache_resource
 def qa_llm():
-    llm = llm_pipeline()
+    qa_prompt = set_custom_prompt()
     embedding = embeddings()
+    llm = load_model()
     settings = chroma_settings()
     db = Chroma(persist_directory="db", embedding_function=embedding, client_settings=settings)
-    retriever = db.as_retriever()
-    qa = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True
-    )
+    qa = RetrievalQA.from_llm(llm, qa_prompt, db)
     return qa
 
 
@@ -116,6 +122,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
 st.markdown(f"""
     <style>
     .sidebar.fixed {{
@@ -161,14 +168,10 @@ with st.sidebar:
             file_extension = pdf.name.split(".")[-1].lower()
             if file_extension == "pdf":
                 pdf_reader = PdfReader(pdf)
-                text = ""
                 document = []
                 for page in pdf_reader.pages:
                     document += page.extract_text()
-                    text += page.extract_text()
-                uploaded_text1 = text
                 uploaded_text = document
-                st.write(uploaded_text1)
                 is_pdf_uploaded = True
     submit_button = st.sidebar.button("SUBMIT")
 
@@ -180,4 +183,5 @@ with st.sidebar:
 previously_asked_queries = []
 
 st.sidebar.markdown("## Previously Asked Queries")
+
 
